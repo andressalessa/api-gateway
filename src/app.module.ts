@@ -1,41 +1,55 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { ProxyModule } from './proxy/proxy.module';
 import { MiddlewareModule } from './middleware/middleware.module';
 import { LoggingMiddleware } from './middleware/logging/logging.middleware';
 import { AuthModule } from './auth/auth.module';
+import { APP_GUARD } from '@nestjs/core';
+import { CustomThrottlerGuard } from './guards/throttler.guard';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
     }),
-    ThrottlerModule.forRoot([
-      {
-        name: 'short',
-        ttl: 1000, // 1 sec
-        limit: 10, // 10 requests per minute
-      },
-      {
-        name: 'medium',
-        ttl: 60000, // 1 minute
-        limit: 100, // 100 requests per minute
-      },
-      {
-        name: 'long',
-        ttl: 900000, // 15 minutes
-        limit: 1000, // 100 requests per minute
-      },
-    ]),
+    // forRootAsync is needed because another service is been used, so first he needs to load it, to then use it
+    // dependency injection
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: (configService: ConfigService) => [
+        {
+          name: 'short',
+          ttl: 1000, // 1 sec
+          limit: configService.get<number>('RATE_LIMIT_SHORT', 10), // 10 requests per minute
+        },
+        {
+          name: 'medium',
+          ttl: 60000, // 1 minute
+          limit: configService.get<number>('RATE_MEDIUM_SHORT', 100), // 100 requests per minute
+        },
+        {
+          name: 'long',
+          ttl: 900000, // 15 minutes
+          limit: configService.get<number>('RATE_LONG_SHORT', 1000), // 100 requests per minute
+        },
+      ],
+      inject: [ConfigService],
+    }),
     ProxyModule,
     MiddlewareModule,
     AuthModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: CustomThrottlerGuard,
+    },
+  ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
