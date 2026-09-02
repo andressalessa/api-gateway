@@ -67,8 +67,9 @@ export class ProxyService {
 
       return { status: 'healthy', data: response.data };
     } catch (error) {
-      // return { status: 'unhealthy', error: error.message };
-      return { status: 'unhealthy' };
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      return { status: 'unhealthy', error: errorMessage };
     }
   }
 }

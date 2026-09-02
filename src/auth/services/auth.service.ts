@@ -21,6 +21,7 @@ export interface UserSession {
 }
 
 export interface AuthResponse {
+  valid: boolean;
   access_token?: string | null;
   user: User | null;
 }
