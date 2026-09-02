@@ -4,6 +4,8 @@ import { serviceConfig } from '../../config/gateway.config';
 import { firstValueFrom } from 'rxjs';
 import { CircuitBreakerService } from '../../common/circuit-breaker/circuit-breaker.service';
 import { error } from 'console';
+import { CacheFallbackService } from '../../common/fallback/cache.fallback';
+import { DefaultFallbackService } from '../../common/fallback/default.fallback';
 
 interface UserInfo {
   userId: string;
@@ -20,6 +22,8 @@ export class ProxyService {
   constructor(
     private readonly httpService: HttpService,
     private readonly circuitBreakerService: CircuitBreakerService,
+    private readonly cacheFallbackService: CacheFallbackService,
+    private readonly defaultFallbackService: DefaultFallbackService,
   ) {}
 
   async proxyRequest(
@@ -35,6 +39,8 @@ export class ProxyService {
 
     this.logger.log(`Proxying ${method} request to ${serviceName}: ${url}`);
 
+    const fallback = this.createCacheFallback(serviceName, method, path);
+
     return this.circuitBreakerService.executeWithCircuitBreaker(
       async () => {
         const enhanceHeaders = {
@@ -44,7 +50,7 @@ export class ProxyService {
           'x-user-role': userInfo?.role,
         };
 
-        const response = firstValueFrom(
+        const response = await firstValueFrom(
           this.httpService.request({
             method: method.toLowerCase() as HttpMethod,
             url,
@@ -54,12 +60,17 @@ export class ProxyService {
           }),
         );
 
-        return response;
+        if (method.toLowerCase() === 'get') {
+          this.cacheFallbackService.setCacheData(
+            `${serviceName}-${path}`,
+            response.data,
+          );
+        }
+
+        return response.data;
       },
       `proxy-${serviceName}`,
-      () => {
-        throw new Error(`${serviceName} service is temporarily unavailable`);
-      },
+      fallback,
       { failureThreshold: 3, timeout: 10000, resetTimeout: 30000 },
     );
   }
@@ -79,6 +90,44 @@ export class ProxyService {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       return { status: 'unhealthy', error: errorMessage };
+    }
+  }
+
+  createCacheFallback(serviceName: string, method: string, path: string) {
+    switch (serviceName) {
+      case 'users':
+        if (path.includes('/auth/login')) {
+          return this.defaultFallbackService.createErrorFallback(
+            'users',
+            'Authentication service unavailable.',
+          );
+        }
+        return this.defaultFallbackService.createErrorFallback(
+          'users',
+          'User service unavailable.',
+        );
+      case 'products':
+        if (method.toLowerCase() === 'get') {
+          return this.cacheFallbackService.createCacheFallback(
+            `products-${path}`,
+            { products: [], total: 0, page: 1, limit: 10 },
+          );
+        }
+        return this.defaultFallbackService.createErrorFallback(
+          'products',
+          'Product service unavailable.',
+        );
+      case 'checkout':
+      case 'payments':
+        return this.defaultFallbackService.createErrorFallback(
+          serviceName,
+          `${serviceName} service unavailable.`,
+        );
+      default:
+        return this.defaultFallbackService.createErrorFallback(
+          serviceName,
+          `${serviceName} service unavailable.`,
+        );
     }
   }
 }
