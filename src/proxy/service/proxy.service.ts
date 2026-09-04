@@ -3,9 +3,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { serviceConfig } from '../../config/gateway.config';
 import { firstValueFrom } from 'rxjs';
 import { CircuitBreakerService } from '../../common/circuit-breaker/circuit-breaker.service';
-import { error } from 'console';
 import { CacheFallbackService } from '../../common/fallback/cache.fallback';
 import { DefaultFallbackService } from '../../common/fallback/default.fallback';
+import { TimeoutService } from '../../common/timeout/timeout.service';
+import { RetryService } from '../../common/retry/retry.service';
 
 interface UserInfo {
   userId: string;
@@ -24,6 +25,8 @@ export class ProxyService {
     private readonly circuitBreakerService: CircuitBreakerService,
     private readonly cacheFallbackService: CacheFallbackService,
     private readonly defaultFallbackService: DefaultFallbackService,
+    private readonly timeoutService: TimeoutService,
+    private readonly retryService: RetryService,
   ) {}
 
   async proxyRequest(
@@ -39,72 +42,69 @@ export class ProxyService {
 
     this.logger.log(`Proxying ${method} request to ${serviceName}: ${url}`);
 
-    const fallback = this.createCacheFallback(serviceName, method, path);
+    const fallback = this.createServiceFallback(serviceName, method, path);
 
     return this.circuitBreakerService.executeWithCircuitBreaker(
       async () => {
-        const enhanceHeaders = {
-          ...headers,
-          'x-user-id': userInfo?.userId,
-          'x-user-email': userInfo?.email,
-          'x-user-role': userInfo?.role,
-        };
+        return await this.retryService.executeWithExponentialBackoff(
+          async () => {
+            return await this.timeoutService.executeWithCustomTimeout(
+              async () => {
+                const enhancedHeaders = {
+                  ...headers,
+                  'x-user-id': userInfo?.userId,
+                  'x-user-email': userInfo?.email,
+                  'x-user-role': userInfo?.role,
+                };
 
-        const response = await firstValueFrom(
-          this.httpService.request({
-            method: method.toLowerCase() as HttpMethod,
-            url,
-            data,
-            headers: enhanceHeaders,
-            timeout: service.timeout,
-          }),
+                const response = await firstValueFrom(
+                  this.httpService.request({
+                    method: method.toLowerCase() as HttpMethod,
+                    url,
+                    data,
+                    headers: enhancedHeaders,
+                    timeout: service.timeout,
+                  }),
+                );
+
+                if (method.toLowerCase() === 'get') {
+                  this.cacheFallbackService.setCacheData(
+                    `${serviceName}-${path}`,
+                    response.data,
+                  );
+                }
+
+                return response.data;
+              },
+              service.timeout,
+            );
+          },
+          4,
         );
-
-        if (method.toLowerCase() === 'get') {
-          this.cacheFallbackService.setCacheData(
-            `${serviceName}-${path}`,
-            response.data,
-          );
-        }
-
-        return response.data;
       },
       `proxy-${serviceName}`,
       fallback,
-      { failureThreshold: 3, timeout: 10000, resetTimeout: 30000 },
+      { failureThreshold: 3, timeout: 30000, resetTimeout: 30000 },
     );
   }
 
-  async getServiceHealth(serviceName: keyof typeof serviceConfig) {
-    try {
-      const service = serviceConfig[serviceName];
-
-      const response = await firstValueFrom(
-        this.httpService.get(`${service.url}/health`, {
-          timeout: 3000,
-        }),
-      );
-
-      return { status: 'healthy', data: response.data };
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      return { status: 'unhealthy', error: errorMessage };
-    }
-  }
-
-  createCacheFallback(serviceName: string, method: string, path: string) {
+  private createServiceFallback(
+    serviceName: string,
+    method: string,
+    path: string,
+  ) {
     switch (serviceName) {
       case 'users':
         if (path.includes('/auth/login')) {
           return this.defaultFallbackService.createErrorFallback(
             'users',
-            'Authentication service unavailable.',
+            'Authentication service unavailable',
           );
         }
+
         return this.defaultFallbackService.createErrorFallback(
           'users',
-          'User service unavailable.',
+          'User service unavailable',
         );
       case 'products':
         if (method.toLowerCase() === 'get') {
@@ -113,20 +113,21 @@ export class ProxyService {
             { products: [], total: 0, page: 1, limit: 10 },
           );
         }
+
         return this.defaultFallbackService.createErrorFallback(
           'products',
-          'Product service unavailable.',
+          'Product service unavailable',
         );
       case 'checkout':
       case 'payments':
         return this.defaultFallbackService.createErrorFallback(
           serviceName,
-          `${serviceName} service unavailable.`,
+          `${serviceName} service unavailable`,
         );
       default:
         return this.defaultFallbackService.createErrorFallback(
           serviceName,
-          `${serviceName} service unavailable.`,
+          'Service unavailable',
         );
     }
   }
